@@ -90,7 +90,7 @@
     background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(12px);
     border-top:1px solid var(--border);}
   .tabbar button{display:flex;flex-direction:column;align-items:center;gap:2px;
-    font-size:11px;color:var(--muted);padding:6px 22px;border-radius:14px;}
+    font-size:11px;color:var(--muted);padding:6px 18px;border-radius:14px;}
   .tabbar button .ic{font-size:20px;}
   .tabbar button.active{color:var(--accent);}
 
@@ -132,6 +132,27 @@
     padding:15px;border-radius:14px;margin-top:10px;}
   .note{font-size:12px;color:var(--muted);margin-top:14px;text-align:center;line-height:1.5;}
   .hidden{display:none!important;}
+
+  /* Rulebook */
+  .rb-sub{color:var(--muted);font-size:14px;margin:0 0 16px;}
+  .rb-add{display:flex;gap:8px;margin-bottom:18px;}
+  .rb-add input{flex:1;font-size:16px;padding:12px 14px;border-radius:12px;
+    border:1px solid var(--border);background:var(--card);color:var(--text);}
+  .rb-add button{background:var(--accent);color:#fff;font-size:15px;font-weight:700;
+    padding:0 18px;border-radius:12px;}
+  .rb-list{display:flex;flex-direction:column;gap:8px;}
+  .rb-item{display:flex;align-items:center;gap:10px;background:var(--card);
+    border-radius:12px;padding:12px 14px;}
+  .rb-item .emo{font-size:20px;}
+  .rb-item .txt{flex:1;font-size:16px;}
+  .rb-item .txt[contenteditable]{outline:none;}
+  .rb-item .txt[contenteditable]:focus{border-bottom:2px solid var(--accent);}
+  .rb-item .del{color:var(--muted);font-size:20px;width:30px;height:30px;border-radius:50%;}
+  .rb-item .del:active{background:var(--bg);}
+  .rb-empty{color:var(--muted);text-align:center;padding:30px 0;}
+  .rb-setup{background:var(--card);border-radius:14px;padding:18px;font-size:14px;line-height:1.6;}
+  .rb-setup code{display:block;background:var(--bg);border:1px solid var(--border);
+    border-radius:8px;padding:10px;margin-top:8px;font-size:12px;white-space:pre-wrap;user-select:text;}
 </style>
 </head>
 <body>
@@ -155,10 +176,12 @@ const HEADERS = {
 
 /* ============ State ============ */
 let logs = {};                       // "yyyy-mm-dd|slot" -> "had"|"none"
-let view = "calendar";               // "calendar" | "progress"
+let view = "calendar";               // "calendar" | "progress" | "rulebook"
 let cursor = new Date();             // month being viewed
 let lastSyncMsg = "";
 let lastSyncErr = false;
+let rules = [];                      // [{id, text}, ...] shared rulebook
+let rulesNeedSetup = false;          // true if the `rules` table doesn't exist yet
 
 const S = {
   get slot(){ return localStorage.getItem("mySlot") || ""; },
@@ -216,7 +239,71 @@ async function refresh(){
     lastSyncErr = true;
     lastSyncMsg = "Offline — " + e.message;
   }
+  await fetchRules();
   render();
+}
+
+/* ----- Rulebook table (shared, freely editable by both users) ----- */
+async function fetchRules(){
+  try{
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rules?select=id,text&order=id.asc`, {headers:HEADERS});
+    if(res.status === 404){ rulesNeedSetup = true; return; }  // table not created yet
+    if(!res.ok) throw new Error("HTTP "+res.status);
+    rules = await res.json();
+    rulesNeedSetup = false;
+  }catch(e){ /* keep last-known rules; the sync banner already reflects offline */ }
+}
+
+async function addRule(text){
+  text = (text||"").trim();
+  if(!text) return;
+  const temp = {id:"tmp"+Date.now(), text};
+  rules = [...rules, temp];
+  render();
+  try{
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rules`, {
+      method:"POST",
+      headers:{...HEADERS, "Prefer":"return=representation"},
+      body: JSON.stringify([{text}])
+    });
+    if(!res.ok) throw new Error("HTTP "+res.status);
+    const [saved] = await res.json();
+    rules = rules.map(r => r.id===temp.id ? saved : r);
+  }catch(e){
+    rules = rules.filter(r => r.id!==temp.id);   // roll back
+    alert("Couldn't add: " + e.message);
+  }
+  render();
+}
+
+async function deleteRule(id){
+  const prev = rules;
+  rules = rules.filter(r => r.id!==id);
+  render();
+  if(String(id).startsWith("tmp")) return;       // never saved
+  try{
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rules?id=eq.${id}`, {
+      method:"DELETE", headers:{...HEADERS, "Prefer":"return=minimal"}
+    });
+    if(!res.ok) throw new Error("HTTP "+res.status);
+  }catch(e){ rules = prev; alert("Couldn't delete: " + e.message); render(); }
+}
+
+async function editRule(id, text){
+  text = (text||"").trim();
+  const current = rules.find(r => r.id===id);
+  if(!current || current.text===text) return;    // no change
+  if(!text){ deleteRule(id); return; }
+  const prev = rules;
+  rules = rules.map(r => r.id===id ? {...r, text} : r);
+  if(String(id).startsWith("tmp")) return;
+  try{
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rules?id=eq.${id}`, {
+      method:"PATCH", headers:{...HEADERS, "Prefer":"return=minimal"},
+      body: JSON.stringify({text})
+    });
+    if(!res.ok) throw new Error("HTTP "+res.status);
+  }catch(e){ rules = prev; alert("Couldn't save: " + e.message); render(); }
 }
 
 async function setStatus(day, slot, newStatus){
@@ -255,7 +342,8 @@ const app = document.getElementById("app");
 function render(){
   if(!S.configured){ renderOnboarding(); return; }
   if(view === "calendar") renderCalendar();
-  else renderProgress();
+  else if(view === "progress") renderProgress();
+  else renderRulebook();
   renderTabbar();
 }
 
@@ -394,13 +482,62 @@ function renderProgress(){
     <div class="sync ${lastSyncErr?'err':''}">${escapeHtml(lastSyncMsg)}</div>`;
 }
 
+function renderRulebook(){
+  if(rulesNeedSetup){
+    app.innerHTML = `
+      <h1>Rulebook</h1>
+      <div class="rb-setup">
+        <b>One-time setup.</b> In your Supabase dashboard → <b>SQL Editor</b>, run this once, then reopen this tab:
+        <code>create table if not exists rules (
+  id bigint generated always as identity primary key,
+  text text not null,
+  created_at timestamptz not null default now()
+);
+alter table rules disable row level security;
+insert into rules (text) values ('Chocolate');</code>
+      </div>`;
+    return;
+  }
+  const items = rules.length
+    ? rules.map(r => `<div class="rb-item" data-id="${r.id}">
+        <span class="emo">💩</span>
+        <div class="txt" contenteditable="true" data-id="${r.id}">${escapeHtml(r.text)}</div>
+        <button class="del" data-id="${r.id}" aria-label="Delete">×</button>
+      </div>`).join("")
+    : `<div class="rb-empty">No 💩 foods yet. Add the first one above.</div>`;
+
+  app.innerHTML = `
+    <h1>Rulebook</h1>
+    <p class="rb-sub">What counts as 💩 food. Either of you can edit — changes sync to both phones. Tap a name to rename it.</p>
+    <div class="rb-add">
+      <input id="rb-input" placeholder="Add a food… e.g. Chips" autocomplete="off">
+      <button id="rb-addbtn">Add</button>
+    </div>
+    <div class="rb-list">${items}</div>
+    <div class="sync ${lastSyncErr?'err':''}">${escapeHtml(lastSyncMsg)}</div>`;
+
+  const input = app.querySelector("#rb-input");
+  const submit = ()=>{ const v=input.value; input.value=""; addRule(v); };
+  app.querySelector("#rb-addbtn").onclick = submit;
+  input.addEventListener("keydown", e=>{ if(e.key==="Enter") submit(); });
+
+  app.querySelectorAll(".rb-item .del").forEach(b=>{
+    b.onclick = ()=> deleteRule(idOf(b.dataset.id));
+  });
+  app.querySelectorAll(".rb-item .txt").forEach(t=>{
+    t.addEventListener("blur", ()=> editRule(idOf(t.dataset.id), t.textContent));
+    t.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); t.blur(); } });
+  });
+}
+
 function renderTabbar(){
   let bar = document.getElementById("tabbar");
   if(!bar){ bar = document.createElement("div"); bar.className="tabbar"; bar.id="tabbar"; document.body.appendChild(bar); }
   bar.innerHTML = `
     <button data-v="calendar" class="${view==='calendar'?'active':''}"><span class="ic">📅</span>Calendar</button>
-    <button data-v="progress" class="${view==='progress'?'active':''}"><span class="ic">📊</span>Progress</button>`;
-  bar.querySelectorAll("button").forEach(b=> b.onclick = ()=>{ view=b.dataset.v; refresh(); });
+    <button data-v="progress" class="${view==='progress'?'active':''}"><span class="ic">📊</span>Progress</button>
+    <button data-v="rulebook" class="${view==='rulebook'?'active':''}"><span class="ic">💩</span>Rulebook</button>`;
+  bar.querySelectorAll("button").forEach(b=> b.onclick = ()=>{ view=b.dataset.v; render(); refresh(); });
 }
 
 /* ============ Day editor sheet ============ */
@@ -485,6 +622,7 @@ function openSettings(){
 /* ============ utils ============ */
 function escapeHtml(s){ return String(s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
 function escapeAttr(s){ return escapeHtml(s); }
+function idOf(s){ return String(s).startsWith("tmp") ? s : Number(s); }
 
 /* ============ boot ============ */
 render();
